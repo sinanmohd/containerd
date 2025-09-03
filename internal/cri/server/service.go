@@ -114,6 +114,8 @@ type ImageService interface {
 
 // criService implements CRIService.
 type criService struct {
+	runtime.UnimplementedRuntimeServiceServer
+
 	RuntimeService
 	ImageService
 	// config contains all configurations.
