@@ -71,53 +71,16 @@ var srcCompressions = map[string]tutil.CompressionFactory{
 	"externaltoc-gzip-bestspeed": tutil.ExternalTOCGzipCompressionWithLevel(gzip.BestSpeed),
 }
 
-type layerConfig struct {
-	name              string
-	passThroughConfig passThroughConfig
-}
-
 func TestSuiteLayer(t *testing.T, store metadata.Store) {
-	for _, lc := range []layerConfig{
-		{
-			name: "default",
-			passThroughConfig: passThroughConfig{
-				enable: false,
-			},
-		},
-		{
-			name: "passthrough",
-			passThroughConfig: passThroughConfig{
-				enable:           true,
-				mergeBufferSize:  419430400,
-				mergeWorkerCount: 10,
-			},
-		},
-		{
-			name: "passthorough without concorrency",
-			passThroughConfig: passThroughConfig{
-				enable:           true,
-				mergeBufferSize:  419430400,
-				mergeWorkerCount: 1,
-			},
-		},
-		{
-			name: "passthorough with small buffer",
-			passThroughConfig: passThroughConfig{
-				enable:           true,
-				mergeBufferSize:  1,
-				mergeWorkerCount: 10,
-			},
-		},
-	} {
-		testPrefetch(t, store, lc)
-		testNodeRead(t, store, lc)
-		testNodes(t, store, lc)
-	}
+	testPrefetch(t, store)
+	testNodeRead(t, store)
+	testPassThroughRead(t, store)
+	testNodes(t, store)
 }
 
 var testStateLayerDigest = digest.FromString("dummy")
 
-func testPrefetch(t *testing.T, factory metadata.Store, lc layerConfig) {
+func testPrefetch(t *testing.T, factory metadata.Store) {
 	data64KB := string(tutil.RandomBytes(t, 64000))
 	defaultPrefetchSize := int64(10000)
 	landmarkPosition := func(t *testing.T, l *layer) int64 {
@@ -218,7 +181,7 @@ func testPrefetch(t *testing.T, factory metadata.Store, lc layerConfig) {
 	for _, tt := range tests {
 		for srcCompressionName, srcCompression := range srcCompressions {
 			cl := srcCompression()
-			t.Run("testPrefetch-"+tt.name+"-"+srcCompressionName+"-"+lc.name, func(t *testing.T) {
+			t.Run("testPrefetch-"+tt.name+"-"+srcCompressionName, func(t *testing.T) {
 				chunkSize := sampleChunkSize
 				if tt.chunkSize > 0 {
 					chunkSize = tt.chunkSize
@@ -254,9 +217,11 @@ func testPrefetch(t *testing.T, factory metadata.Store, lc layerConfig) {
 						backgroundTaskManager: task.NewBackgroundTaskManager(10, 5*time.Second),
 					},
 					ocispec.Descriptor{Digest: testStateLayerDigest},
-					&blobRef{blob, func(bool) {}},
+					&blobRef{blob, func() {}},
 					vr,
-					lc.passThroughConfig,
+					passThroughConfig{
+						enable: false,
+					},
 				)
 				if err := l.Verify(dgst); err != nil {
 					t.Errorf("failed to verify reader: %v", err)
@@ -418,7 +383,15 @@ const (
 	lastChunkOffset1   = sampleChunkSize * (int64(len(sampleData1)) / sampleChunkSize)
 )
 
-func testNodeRead(t *testing.T, factory metadata.Store, lc layerConfig) {
+func testPassThroughRead(t *testing.T, factory metadata.Store) {
+	nodeRead(t, factory, true)
+}
+
+func testNodeRead(t *testing.T, factory metadata.Store) {
+	nodeRead(t, factory, false)
+}
+
+func nodeRead(t *testing.T, factory metadata.Store, pth bool) {
 	sizeCond := map[string]int64{
 		"single_chunk": sampleChunkSize - sampleMiddleOffset,
 		"multi_chunks": sampleChunkSize + sampleMiddleOffset,
@@ -443,7 +416,7 @@ func testNodeRead(t *testing.T, factory metadata.Store, lc layerConfig) {
 				for fn, filesize := range fileSizeCond {
 					for _, srcCompression := range srcCompressions {
 						cl := srcCompression()
-						t.Run(fmt.Sprintf("reading_%s_%s_%s_%s_%s", sn, in, bo, fn, lc.name), func(t *testing.T) {
+						t.Run(fmt.Sprintf("reading_%s_%s_%s_%s", sn, in, bo, fn), func(t *testing.T) {
 							if filesize > int64(len(sampleData1)) {
 								t.Fatal("sample file size is larger than sample data")
 							}
@@ -467,7 +440,7 @@ func testNodeRead(t *testing.T, factory metadata.Store, lc layerConfig) {
 							}
 
 							// data we get from the file node.
-							f, closeFn := makeNodeReader(t, []byte(sampleData1)[:filesize], sampleChunkSize, factory, cl, lc)
+							f, closeFn := makeNodeReader(t, []byte(sampleData1)[:filesize], sampleChunkSize, factory, cl, pth)
 							defer closeFn()
 							tmpbuf := make([]byte, size) // fuse library can request bigger than remain
 							rr, errno := f.Read(context.Background(), tmpbuf, offset)
@@ -498,7 +471,7 @@ func testNodeRead(t *testing.T, factory metadata.Store, lc layerConfig) {
 	}
 }
 
-func makeNodeReader(t *testing.T, contents []byte, chunkSize int, factory metadata.Store, cl tutil.Compression, lc layerConfig) (_ *file, closeFn func() error) {
+func makeNodeReader(t *testing.T, contents []byte, chunkSize int, factory metadata.Store, cl tutil.Compression, pth bool) (_ *file, closeFn func() error) {
 	testName := "test"
 	sr, tocDgst, err := tutil.BuildEStargz(
 		[]tutil.TarEntry{tutil.File(testName, string(contents))},
@@ -511,7 +484,7 @@ func makeNodeReader(t *testing.T, contents []byte, chunkSize int, factory metada
 	if err != nil {
 		t.Fatalf("failed to create reader: %v", err)
 	}
-	rootNode := getRootNode(t, r, OverlayOpaqueAll, tocDgst, cache.NewMemoryCache(), lc)
+	rootNode := getRootNode(t, r, OverlayOpaqueAll, tocDgst, cache.NewMemoryCache(), pth)
 	var eo fuse.EntryOut
 	inode, errno := rootNode.Lookup(context.Background(), testName, &eo)
 	if errno != 0 {
@@ -526,13 +499,13 @@ func makeNodeReader(t *testing.T, contents []byte, chunkSize int, factory metada
 	return f.(*file), r.Close
 }
 
-func testNodes(t *testing.T, factory metadata.Store, lc layerConfig) {
+func testNodes(t *testing.T, factory metadata.Store) {
 	for _, o := range []OverlayOpaqueType{OverlayOpaqueAll, OverlayOpaqueTrusted, OverlayOpaqueUser} {
-		testNodesWithOpaque(t, factory, o, lc)
+		testNodesWithOpaque(t, factory, o)
 	}
 }
 
-func testNodesWithOpaque(t *testing.T, factory metadata.Store, opaque OverlayOpaqueType, lc layerConfig) {
+func testNodesWithOpaque(t *testing.T, factory metadata.Store, opaque OverlayOpaqueType) {
 	data64KB := string(tutil.RandomBytes(t, 64000))
 	hasOpaque := func(entry string) check {
 		return func(t *testing.T, root *node, cc cache.BlobCache, cr *calledReaderAt) {
@@ -741,7 +714,7 @@ func testNodesWithOpaque(t *testing.T, factory metadata.Store, opaque OverlayOpa
 	for _, tt := range tests {
 		for _, srcCompression := range srcCompressions {
 			cl := srcCompression()
-			t.Run(tt.name+"-"+lc.name, func(t *testing.T) {
+			t.Run(tt.name, func(t *testing.T) {
 				opts := []tutil.BuildEStargzOption{
 					tutil.WithEStargzOptions(estargz.WithCompression(cl)),
 				}
@@ -763,7 +736,7 @@ func testNodesWithOpaque(t *testing.T, factory metadata.Store, opaque OverlayOpa
 				}
 				defer r.Close()
 				mcache := cache.NewMemoryCache()
-				rootNode := getRootNode(t, r, opaque, tocDgst, mcache, lc)
+				rootNode := getRootNode(t, r, opaque, tocDgst, mcache, false)
 				for _, want := range tt.want {
 					want(t, rootNode, mcache, testR)
 				}
@@ -772,7 +745,7 @@ func testNodesWithOpaque(t *testing.T, factory metadata.Store, opaque OverlayOpa
 	}
 }
 
-func getRootNode(t *testing.T, r metadata.Reader, opaque OverlayOpaqueType, tocDgst digest.Digest, cc cache.BlobCache, lc layerConfig) *node {
+func getRootNode(t *testing.T, r metadata.Reader, opaque OverlayOpaqueType, tocDgst digest.Digest, cc cache.BlobCache, pth bool) *node {
 	vr, err := reader.NewReader(r, cc, digest.FromString(""))
 	if err != nil {
 		t.Fatalf("failed to create reader: %v", err)
@@ -781,7 +754,11 @@ func getRootNode(t *testing.T, r metadata.Reader, opaque OverlayOpaqueType, tocD
 	if err != nil {
 		t.Fatalf("failed to verify reader: %v", err)
 	}
-	rootNode, err := newNode(testStateLayerDigest, rr, &testBlobState{10, 5}, 100, opaque, lc.passThroughConfig)
+	rootNode, err := newNode(testStateLayerDigest, rr, &testBlobState{10, 5}, 100, opaque, passThroughConfig{
+		enable:           pth,
+		mergeBufferSize:  419430400,
+		mergeWorkerCount: 10,
+	})
 	if err != nil {
 		t.Fatalf("failed to get root node: %v", err)
 	}
